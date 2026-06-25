@@ -26,3 +26,6 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: hevy2garmin sync
+
+      - name: Keep repository active
+        uses: gautamkrishnar/keepalive-workflow@v2
