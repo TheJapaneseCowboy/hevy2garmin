@@ -39,6 +39,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "hr_fusion": {
         "enabled": True,
     },
+    "merge_activity_types": ["strength_training"],
+    # What to do when a workout was recorded on a watch (Garmin will not show
+    # pushed exercise names on those). One activity in every case (#159):
+    #   "replace" (default): upload one named activity and delete the watch
+    #       recording. Named exercises, but loses watch-only metrics.
+    #   "merge": push the sets/reps/weights into the watch activity and keep it.
+    #       Keeps all watch metrics; exercise names show as "Unknown".
+    #   "describe": keep the watch activity, only list exercises in its
+    #       description (no structured sets).
+    "merge_watch_strategy": "replace",
 }
 
 
@@ -107,12 +117,37 @@ def load_config() -> dict[str, Any]:
 
 
 def save_config(config: dict[str, Any]) -> None:
-    """Save config to file. Silently skips on read-only filesystems (Vercel)."""
+    """Persist config: to file (local/Docker) and to the DB on cloud deployments.
+
+    On serverless (Vercel) the home filesystem is read-only, so the file write
+    is a no-op and the canonical store is the Postgres ``app_cache`` table. We
+    write the same keys ``load_config()`` reads back, so settings survive across
+    stateless invocations instead of reverting to defaults (#139, #145).
+    """
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_FILE.write_text(json.dumps(config, indent=2))
     except OSError:
         logger.debug("Skipping config file write (read-only filesystem)")
+
+    # Cloud deployments: persist user-editable settings to the DB so callers
+    # that only call save_config() (e.g. Pull-from-Garmin) don't silently lose
+    # data on read-only filesystems. Symmetric with the keys load_config() reads.
+    from hevy2garmin.db import get_database_url
+
+    if not get_database_url():
+        return
+    try:
+        from hevy2garmin.db import get_db
+
+        _db = get_db()
+        if hasattr(_db, "set_app_config"):
+            for key in ("user_profile", "timing", "hr_fusion"):
+                value = config.get(key)
+                if isinstance(value, dict):
+                    _db.set_app_config(key, value)
+    except Exception:
+        logger.debug("Could not persist config to DB", exc_info=True)
 
 
 def get(key: str, default: Any = None) -> Any:

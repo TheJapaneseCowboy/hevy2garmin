@@ -12,6 +12,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -38,6 +39,49 @@ class MergeResult:
     merged: bool
     activity_id: int | None = None
     fallback_reason: str | None = None
+    # Set when the merge pushed sets but Garmin dropped the exercise names on a
+    # watch-recorded activity (#159). Tells the caller to upload a SEPARATE
+    # named activity instead of deduping against the watch activity.
+    force_fresh_upload: bool = False
+    # Watch activity id to delete AFTER a successful fresh upload, so the workout
+    # ends up as a single named activity ("replace" strategy, #159).
+    delete_after_upload: int | None = None
+
+
+def _names_applied(client, activity_id) -> bool:
+    """Check whether Garmin actually kept the exercise identities after a PUT.
+
+    Watch-recorded strength activities accept the sets (HTTP 204) but silently
+    drop the exercise category/name, leaving every set as "Choose an Exercise"
+    (#159, confirmed live). Returns True if at least one active set came back
+    with a real category, False if the names were dropped. Returns True on any
+    read error so an unverifiable merge is not needlessly discarded.
+    """
+    time.sleep(4)  # let Garmin process the PUT before reading back
+    try:
+        after = get_activity_exercise_sets(client, activity_id)
+    except Exception:
+        return True
+    cats = [
+        e.get("category")
+        for s in (after.get("exerciseSets") or [])
+        if s.get("setType") == "ACTIVE"
+        for e in (s.get("exercises") or [])
+    ]
+    if not cats:
+        return False
+    return any(c and c != "UNKNOWN" for c in cats)
+
+
+def _restore_sets(client, activity_id, database) -> None:
+    """Restore an activity's pre-merge exercise sets from the backup."""
+    try:
+        backup = database.get_app_config(f"merge_backup_{activity_id}")
+        original = (backup or {}).get("original_sets")
+        if original and original.get("exerciseSets") is not None:
+            push_exercise_sets(client, activity_id, original)
+    except Exception as e:
+        logger.warning("Could not restore sets for %s: %s", activity_id, e)
 
 
 def reset_circuit_breaker() -> None:
@@ -82,30 +126,26 @@ def _category_to_string(cat_id: int) -> str:
     return _CATEGORY_NAMES.get(cat_id, "UNKNOWN")
 
 
-def _exercise_to_string(cat_id: int, sub_id: int) -> str:
-    """Convert FIT category + subcategory IDs to Garmin exercise name string.
+def _exercise_to_string(cat_id: int, sub_id: int) -> str | None:
+    """Resolve FIT (category, subcategory) IDs to Garmin's subcategory enum name.
 
-    Falls back to the category name if the subcategory isn't mapped.
-    Garmin's exerciseSets API accepts the category name as the exercise name.
+    Returns the valid subcategory string (e.g. ``"BARBELL_BENCH_PRESS"``) or
+    ``None`` when it can't be resolved. We must NOT fall back to the parent
+    category name: Garmin's ``exerciseSets`` API renders an unrecognised exercise
+    *name* as **"Unknown"** (#138), whereas a ``null`` name under a valid parent
+    category is accepted and shown as the category's generic label.
     """
     try:
-        from fit_tool.profile.profile_type import ExerciseCategory
-        # fit_tool has per-category exercise enums, but they're not always
-        # available or complete. Try to get the string name.
-        cat_enum = ExerciseCategory(cat_id)
-        # Look for a subcategory enum for this category
-        # e.g., for BENCH_PRESS (0), there's BenchPressExerciseName
-        cat_name = cat_enum.name  # "BENCH_PRESS"
-        # The subcategory enum class name follows a pattern
-        sub_enum_name = cat_name.title().replace("_", "") + "ExerciseName"
         import fit_tool.profile.profile_type as pt
-        sub_enum_cls = getattr(pt, sub_enum_name, None)
-        if sub_enum_cls:
+        from fit_tool.profile.profile_type import ExerciseCategory
+        # e.g. BENCH_PRESS (0) → BenchPressExerciseName enum
+        cat_name = ExerciseCategory(cat_id).name  # "BENCH_PRESS"
+        sub_enum_cls = getattr(pt, cat_name.title().replace("_", "") + "ExerciseName", None)
+        if sub_enum_cls is not None:
             return sub_enum_cls(sub_id).name
     except (ValueError, AttributeError, ImportError):
         pass
-    # Fallback: use category name (Garmin accepts this)
-    return _category_to_string(cat_id)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -188,13 +228,17 @@ def build_exercise_sets_payload(
         ex_idx = si["ex_idx"]
         ex = exercises[ex_idx]
 
-        cat_id, sub_id, _ = lookup_exercise(ex.get("title") or ex.get("name", "Unknown"))
+        cat_id, sub_id, _ = lookup_exercise(ex.get("title") or ex.get("name", "Unknown"), ex.get("exercise_template_id"))
         cat_str = _category_to_string(cat_id)
-        ex_str = _exercise_to_string(cat_id, sub_id)
-        # Garmin rejects UNKNOWN category — fall back to TOTAL_BODY
+        sub_name = _exercise_to_string(cat_id, sub_id)
+        # Garmin rejects an UNKNOWN category, so fall back to the generic
+        # TOTAL_BODY *parent*. But never send the parent name (or "TOTAL_BODY")
+        # as the exercise *name*: Garmin renders an unrecognised name as
+        # "Unknown" (#138). A null name under a valid parent is accepted and
+        # shown as the category's generic label.
         if cat_str == "UNKNOWN":
             cat_str = "TOTAL_BODY"
-            ex_str = "TOTAL_BODY"
+            sub_name = None
 
         set_start = act_start + timedelta(seconds=cursor_s)
         scaled_dur = si["set_dur"] * scale
@@ -204,7 +248,7 @@ def build_exercise_sets_payload(
         weight_kg = s.get("weight_kg")
 
         active_set: dict = {
-            "exercises": [{"category": cat_str, "name": ex_str}],
+            "exercises": [{"category": cat_str, "name": sub_name, "probability": None}],
             "duration": round(scaled_dur, 3),
             "repetitionCount": int(reps) if reps is not None else 0,
             "weight": float(round(weight_kg * 1000)) if weight_kg else 0.0,
@@ -236,11 +280,30 @@ def build_exercise_sets_payload(
     return {"activityId": activity_id, "exerciseSets": exercise_sets}
 
 
+def _apply_name_and_description(client, activity_id, hevy_workout) -> None:
+    """Rename a Garmin activity to the Hevy title and set its exercise description."""
+    title = hevy_workout.get("title", "Workout")
+    rename_activity(client, activity_id, title)
+    desc = generate_description(hevy_workout)
+    note = "synced by hevy2garmin"
+    if not desc.rstrip().endswith(note):
+        desc = f"{desc}\n{note}"
+    set_description(client, activity_id, f"Exercises synced from Hevy by hevy2garmin\n\n{desc}")
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
-def attempt_merge(client, hevy_workout: dict, database, overlap_threshold: float = 0.70, max_drift_minutes: int = 20) -> MergeResult:
+def attempt_merge(
+    client,
+    hevy_workout: dict,
+    database,
+    overlap_threshold: float = 0.70,
+    max_drift_minutes: int = 20,
+    activity_types: set[str] | None = None,
+    watch_strategy: str = "replace",
+) -> MergeResult:
     """Try to merge Hevy exercise data into a matching Garmin activity.
 
     Returns MergeResult with merged=True if successful, or merged=False
@@ -252,7 +315,7 @@ def attempt_merge(client, hevy_workout: dict, database, overlap_threshold: float
         return MergeResult(merged=False, fallback_reason="Circuit breaker: too many PUT failures")
 
     # Find matching activity
-    match = find_matching_garmin_activity(client, hevy_workout, overlap_threshold=overlap_threshold, max_drift_minutes=max_drift_minutes)
+    match = find_matching_garmin_activity(client, hevy_workout, overlap_threshold=overlap_threshold, max_drift_minutes=max_drift_minutes, activity_types=activity_types)
     if not match:
         return MergeResult(merged=False, fallback_reason="No matching Garmin activity found")
 
@@ -262,6 +325,55 @@ def attempt_merge(client, hevy_workout: dict, database, overlap_threshold: float
 
     if not activity_id or not act_start or not act_duration:
         return MergeResult(merged=False, fallback_reason="Matched activity missing required fields")
+
+    # Garmin only displays pushed exercise identities on activities hevy2garmin
+    # created itself (FIT manufacturer "DEVELOPMENT"). On device-recorded
+    # activities (a watch, manufacturer "GARMIN", etc.) the exerciseSets PUT
+    # returns 204 but Garmin ignores it, so the activity shows "Unknown" with no
+    # reps (#159, confirmed against the live API). Reading the sets back cannot
+    # detect this, since the read reflects stored, not displayed, state. So for
+    # any match we did not create, skip the merge and upload a fresh named
+    # activity instead. HR fusion still pulls the watch heart rate into it.
+    manufacturer = str(match.get("manufacturer") or "").upper()
+    is_watch = bool(manufacturer) and manufacturer != "DEVELOPMENT"
+    if is_watch and watch_strategy == "describe":
+        # Keep the single watch activity (its HR + device metrics) and just list
+        # the exercises in its description. No push (Garmin ignores names on watch
+        # activities) and no upload, so it stays one activity.
+        logger.info(
+            "  Match %s recorded by %s; enriching its description (watch_strategy=describe)",
+            activity_id, manufacturer,
+        )
+        try:
+            _apply_name_and_description(client, activity_id, hevy_workout)
+        except Exception as e:
+            logger.warning("Rename/description failed for %s: %s", activity_id, e)
+        return MergeResult(merged=True, activity_id=activity_id)
+
+    if is_watch and watch_strategy == "replace":
+        # Upload one named activity, then delete the watch recording, so the
+        # workout shows up exactly once with named exercises.
+        logger.info(
+            "  Match %s recorded by %s; uploading a named activity and removing the watch copy (watch_strategy=replace)",
+            activity_id, manufacturer,
+        )
+        return MergeResult(
+            merged=False,
+            force_fresh_upload=True,
+            delete_after_upload=activity_id,
+            fallback_reason=f"activity recorded by {manufacturer}; replacing it with a named upload",
+        )
+
+    if is_watch:
+        # watch_strategy == "merge": push the sets/reps/weights into the single
+        # watch activity, keeping all its native metrics (HR, training effect,
+        # body battery). Garmin will not display the exercise NAMES on a
+        # device-recorded activity, so they show as "Unknown", but the structured
+        # sets/reps/weights land in the activity. One activity, no upload/delete.
+        logger.info(
+            "  Match %s recorded by %s; merging sets in place, names may show as Unknown (watch_strategy=merge)",
+            activity_id, manufacturer,
+        )
 
     # Backup existing exercise sets
     try:
@@ -287,17 +399,27 @@ def attempt_merge(client, hevy_workout: dict, database, overlap_threshold: float
         logger.error("PUT exerciseSets failed for activity %s: %s", activity_id, e)
         return MergeResult(merged=False, fallback_reason=f"PUT failed: {e}")
 
+    # hevy2garmin's own uploads (DEVELOPMENT) display the pushed names, so verify
+    # there and fall back to a named upload if Garmin dropped them. For
+    # watch_strategy="merge" we intentionally keep the watch activity even though
+    # Garmin will not show the names, so skip the verify and keep the sets.
+    if not (is_watch and watch_strategy == "merge") and not _names_applied(client, activity_id):
+        logger.info(
+            "  Exercise names not applied on activity %s, restoring and uploading a named activity",
+            activity_id,
+        )
+        _restore_sets(client, activity_id, database)
+        return MergeResult(
+            merged=False,
+            force_fresh_upload=True,
+            fallback_reason="Garmin dropped exercise names on the watch-recorded activity",
+        )
+
     # Rename + set description
     try:
-        rename_activity(client, activity_id, title)
-        desc = generate_description(hevy_workout)
-        if not desc.endswith("— synced by hevy2garmin"):
-            desc += "\n— synced by hevy2garmin"
-        # Prepend merge note
-        desc = "⚡ Exercises synced from Hevy by hevy2garmin\n\n" + desc
-        set_description(client, activity_id, desc)
+        _apply_name_and_description(client, activity_id, hevy_workout)
     except Exception as e:
         logger.warning("Rename/description failed after merge for %s: %s", activity_id, e)
-        # Non-fatal — sets were already pushed
+        # Non-fatal, sets were already pushed
 
     return MergeResult(merged=True, activity_id=activity_id)
